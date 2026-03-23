@@ -276,7 +276,15 @@ def main():
     t_utm  = Transformer.from_crs("EPSG:4326", f"EPSG:{UTM_EPSG}", always_xy=True)
     ox, oy = t_utm.transform(origin_lon, origin_lat)
     textured_mesh.vertices -= np.array([ox, oy, 0.0])
+    center = textured_mesh.bounding_box.centroid
+    textured_mesh.apply_translation(-center)
+    rotation = trimesh.transformations.rotation_matrix(
+        angle=np.radians(-90.0),
+        direction=[1.0, 0.0, 0.0],
+        point=[0.0, 0.0, 0.0],
+    )
 
+    textured_mesh.apply_transform(rotation)
     print(f"Exporting → {OUTPUT_MESH}")
     textured_mesh.export(OUTPUT_MESH)
     print("Done.")
