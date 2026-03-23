@@ -167,10 +167,18 @@ def apply_photo_texture_to_mesh(mesh, image_path):
         t_min, t_max = min(t_all), max(t_all)
         if s_max <= s_min or t_max <= t_min: continue
 
-        # Patch pixel size: match the image-space bounding box of the projection
-        pts_img  = face_proj[proj_i][0]
-        patch_w  = int(np.clip(pts_img[:,0].max() - pts_img[:,0].min(), 2, MAX_PATCH))
-        patch_h  = int(np.clip(pts_img[:,1].max() - pts_img[:,1].min(), 2, MAX_PATCH))
+        # Patch pixel size: use a single consistent pixels-per-metre scale so
+        # that 1 px = the same physical distance in both axes (no stretch).
+        # We derive the scale from the image projection, taking the minimum
+        # px/m across both axes (avoids upscaling the oblique direction).
+        pts_img   = face_proj[proj_i][0]
+        face_w_m  = s_max - s_min          # physical width  (metres)
+        face_h_m  = t_max - t_min          # physical height (metres)
+        img_bw    = max(pts_img[:,0].max() - pts_img[:,0].min(), 1.0)
+        img_bh    = max(pts_img[:,1].max() - pts_img[:,1].min(), 1.0)
+        px_per_m  = min(img_bw / face_w_m, img_bh / face_h_m)
+        patch_w   = int(np.clip(face_w_m * px_per_m, 2, MAX_PATCH))
+        patch_h   = int(np.clip(face_h_m * px_per_m, 2, MAX_PATCH))
 
         # True projective homography: face local (s,t) → image pixel (homogeneous)
         #   H @ [s, t, 1]^T  =  K @ R @ (V0 + s·e1_hat + t·e2_hat − Cw)
