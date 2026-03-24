@@ -4,6 +4,8 @@ import cv2
 import trimesh
 from pyproj import Transformer
 from PIL import Image
+import torch
+from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -61,6 +63,23 @@ MESH_PATH        = "my_region.glb"
 OUTPUT_MESH      = "my_region_textured.glb"
 UTM_EPSG         = 32617
 CAMERA_HEIGHT_M  = 1.6     # fallback altitude when not in metadata
+
+# ── Obstruction removal ────────────────────────────────────────────────────────
+REMOVE_OBSTRUCTIONS = True   # set False to skip segmentation entirely
+
+# Cityscapes training-ID classes to treat as obstructions.
+# See: https://www.cityscapes-dataset.com/dataset-overview/#class-definitions
+OBSTRUCTION_CLASSES = {
+    5,   # pole          (includes street lamps)
+    6,   # traffic light
+    7,   # traffic sign
+    8,   # vegetation    (trees, bushes)
+    11,  # person
+    12,  # rider
+}
+
+# Swap for "swin-small" if you want faster (but less accurate) segmentation.
+SEG_MODEL_ID = "facebook/mask2former-swin-large-cityscapes-semantic"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -130,6 +149,52 @@ def convert_mesh_to_utm(mesh_path, origin_lon, origin_lat):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Obstruction segmentation (Mask2Former / Cityscapes)
+# ──────────────────────────────────────────────────────────────────────────────
+_seg_proc  = None
+_seg_model = None
+
+def _load_seg_model():
+    global _seg_proc, _seg_model
+    if _seg_model is not None:
+        return
+    print(f"Loading segmentation model ({SEG_MODEL_ID}) …")
+    _seg_proc  = AutoImageProcessor.from_pretrained(SEG_MODEL_ID)
+    _seg_model = Mask2FormerForUniversalSegmentation.from_pretrained(SEG_MODEL_ID)
+    _seg_model.eval()
+    if torch.cuda.is_available():
+        _seg_model = _seg_model.cuda()
+        print("  → running on GPU")
+    else:
+        print("  → running on CPU (this will be slow)")
+
+def build_obstruction_mask(img_bgr):
+    """
+    Run Mask2Former semantic segmentation on img_bgr (BGR uint8).
+    Returns a uint8 mask the same size as the input: 255 = obstruction, 0 = clear.
+    """
+    _load_seg_model()
+    h, w   = img_bgr.shape[:2]
+    pil    = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    device = next(_seg_model.parameters()).device
+    inputs = _seg_proc(images=pil, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = _seg_model(**inputs)
+    seg    = _seg_proc.post_process_semantic_segmentation(
+                 outputs, target_sizes=[(h, w)])[0]
+    seg_np = seg.cpu().numpy()                          # (H, W) class IDs
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for cls_id in OBSTRUCTION_CLASSES:
+        mask[seg_np == cls_id] = 255
+
+    # Dilate slightly to clean up segment edges before inpainting
+    mask = cv2.dilate(mask, np.ones((15, 15), np.uint8))
+    return mask
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Core: multi-camera projection → texture atlas
 # ──────────────────────────────────────────────────────────────────────────────
 def apply_photo_texture_to_mesh(mesh, cameras):
@@ -148,6 +213,16 @@ def apply_photo_texture_to_mesh(mesh, cameras):
         if img is None:
             raise FileNotFoundError(cam["image_path"])
         h, w = img.shape[:2]
+        print(f"  Camera {ci}: {cam['image_path']}  ({w}×{h})")
+
+        if REMOVE_OBSTRUCTIONS:
+            print(f"    Segmenting obstructions …")
+            obs_mask = build_obstruction_mask(img)
+            n_obs = int((obs_mask > 0).sum())
+            print(f"    Masking {n_obs:,} obstruction pixels → black")
+            img = img.copy()
+            img[obs_mask > 0] = 0
+
         Cw = camera_center_utm(cam)
         if "computed_rotation" in cam:
             R = rotation_from_angle_axis(cam["computed_rotation"])
@@ -160,7 +235,6 @@ def apply_photo_texture_to_mesh(mesh, cameras):
         else:
             K = build_intrinsics(w, h, cam.get("hfov_deg", 65.0))
         cam_data.append({"img": img, "w": w, "h": h, "Cw": Cw, "R": R, "K": K})
-        print(f"  Camera {ci}: {cam['image_path']}  ({w}×{h})")
 
     verts        = mesh.vertices
     faces        = mesh.faces
