@@ -5,21 +5,67 @@ import trimesh
 from pyproj import Transformer
 from PIL import Image
 
-IMAGE_PATH  = "images/1447902075542541.jpg"
-MESH_PATH   = "my_region.glb"
-OUTPUT_MESH = "my_region_textured.glb"
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# Add as many cameras as you like. Each entry needs:
+#   image_path        – path to the photo file
+#   computed_geometry – GeoJSON Point with [lon, lat]  (use computed_geometry, not geometry)
+#
+# Rotation — provide EITHER:
+#   computed_rotation – Mapillary angle-axis [rx,ry,rz] (preferred, most accurate)
+#   OR: compass_angle + pitch_deg + roll_deg  (fallback)
+#
+# Intrinsics — provide EITHER:
+#   camera_parameters – Mapillary [f_norm, k1, k2]  (preferred; f_norm×max(w,h)=fx)
+#   OR: hfov_deg                                     (fallback)
+#
+#   computed_altitude (optional) – camera height in metres; defaults to CAMERA_HEIGHT_M
+# ──────────────────────────────────────────────────────────────────────────────
+CAMERAS = [
+    {
+        "image_path": "images/1447902075542541.jpg",
+        "computed_geometry": {"type": "Point", "coordinates": [-83.743213758351, 42.275425023057]},
+        "compass_angle": 179.60961914062,
+        "pitch_deg": -9.0,
+        "roll_deg":  0.0,
+        "hfov_deg":  65.0,
+    },
+    {
+        "image_path": "images/736076653727528.jpg",
+        "computed_geometry": {"type": "Point", "coordinates": [-83.744386553314, 42.274203213453]},
+        "computed_rotation": [1.2645213571938, -0.37925136592952, 0.58673461290576],
+        "camera_parameters": [0.82404822558687, 0.041268741919332, -0.053786142448042],
+        "width": 4032,
+        "height": 3024,
+    },
+    {
+        "image_path": "images/2866795086971957.jpg",
+        "computed_geometry": {"type": "Point", "coordinates": [-83.744275700379, 42.274181493597]},
+        "computed_rotation": [1.1475916354054, -0.77857929538535, 1.0469278214094],
+        "camera_parameters": [0.82404822558687, 0.041268741919332, -0.053786142448042],
+        "width": 4032,
+        "height": 3024,
+    },
+    # ── paste additional cameras below ────────────────────────────────────────
+    # {
+    #     "image_path": "images/another_image.jpg",
+    #     "computed_geometry": {"type": "Point", "coordinates": [-83.742, 42.275]},
+    #     "compass_angle": 90.0,
+    #     "pitch_deg": -5.0,
+    #     "roll_deg":  0.0,
+    #     "hfov_deg":  65.0,
+    # },
+]
 
-UTM_EPSG        = 32617
-CAMERA_HEIGHT_M = 1.6
-H_FOV_DEG       = 65.0
-PITCH_DEG       = -9.0
-ROLL_DEG        = 0.0
+MESH_PATH        = "my_region.glb"
+OUTPUT_MESH      = "my_region_textured.glb"
+UTM_EPSG         = 32617
+CAMERA_HEIGHT_M  = 1.6     # fallback altitude when not in metadata
 
-MAPILLARY = {
-    "computed_geometry": {"type": "Point", "coordinates": [-83.743213758351, 42.275425023057]},
-    "compass_angle": 179.60961914062,
-}
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def deg2rad(d): return d * math.pi / 180.0
 
 def build_intrinsics(w, h, hfov_deg):
@@ -36,6 +82,25 @@ def rotation_world_to_camera(yaw_deg, pitch_deg, roll_deg):
     Rx = np.array([[1,0,0],[0,math.cos(pitch),-math.sin(pitch)],[0,math.sin(pitch),math.cos(pitch)]])
     Rz = np.array([[math.cos(roll),-math.sin(roll),0],[math.sin(roll),math.cos(roll),0],[0,0,1]])
     return Rz @ Rx @ R
+
+def rotation_from_angle_axis(aa):
+    """Convert a Mapillary computed_rotation angle-axis vector to a 3×3 matrix.
+    Rotates from world (ENU/UTM) coordinates to camera coordinates."""
+    aa    = np.array(aa, dtype=np.float64)
+    angle = np.linalg.norm(aa)
+    if angle < 1e-9:
+        return np.eye(3)
+    k  = aa / angle
+    K  = np.array([[ 0,    -k[2],  k[1]],
+                   [ k[2],  0,    -k[0]],
+                   [-k[1],  k[0],  0   ]])
+    return np.eye(3) + math.sin(angle) * K + (1 - math.cos(angle)) * (K @ K)
+
+def build_intrinsics_from_params(w, h, camera_parameters):
+    """Build K from Mapillary camera_parameters = [f_norm, k1, k2].
+    f_norm is normalised by max(w, h); k1/k2 are radial distortion (ignored here)."""
+    fx = camera_parameters[0] * max(w, h)
+    return np.array([[fx, 0, w/2.0],[0, fx, h/2.0],[0, 0, 1]], dtype=np.float64)
 
 def camera_center_utm(meta):
     lon, lat = meta["computed_geometry"]["coordinates"]
@@ -57,170 +122,173 @@ def convert_mesh_to_utm(mesh_path, origin_lon, origin_lat):
     ox, oy = t_ll2m.transform(origin_lon, origin_lat)
     nv = np.zeros_like(mesh.vertices)
     for i, v in enumerate(mesh.vertices):
-        lon, lat   = t_m2ll.transform(ox + v[0], oy + v[1])
-        ux, uy     = t_ll2u.transform(lon, lat)
-        nv[i]      = [ux, uy, v[2]]
+        lon, lat = t_m2ll.transform(ox + v[0], oy + v[1])
+        ux, uy   = t_ll2u.transform(lon, lat)
+        nv[i]    = [ux, uy, v[2]]
     mesh.vertices = nv
     return mesh
 
 
-def apply_photo_texture_to_mesh(mesh, image_path):
+# ──────────────────────────────────────────────────────────────────────────────
+# Core: multi-camera projection → texture atlas
+# ──────────────────────────────────────────────────────────────────────────────
+def apply_photo_texture_to_mesh(mesh, cameras):
     """
-    Per-face projective texture extraction.
+    For each mesh face, pick the camera that gives the most frontal (least
+    oblique) view, then extract the face's texture patch via a true projective
+    homography.  All non-visible faces get a neutral gray fallback.
 
-    For each visible face:
-      1. Build the true 3-D→image projective homography H = K @ [R·e1, R·e2, R·(V0-Cw)]
-      2. Compose with a pixel-scale matrix to get  H_atlas: atlas-pixel → image-pixel
-      3. cv2.warpPerspective extracts the face's image patch without distortion
-      4. Pack patches into an atlas; assign UVs from the patch corners
-    All other faces share a gray fallback region.
+    cameras : list of dicts – see CAMERAS at the top of this file.
     """
-    print(f"Loading image: {image_path}")
-    real_img = cv2.imread(image_path)
-    if real_img is None:
-        raise FileNotFoundError(image_path)
-    img_h, img_w = real_img.shape[:2]
 
-    Cw = camera_center_utm(MAPILLARY)
-    R  = rotation_world_to_camera(MAPILLARY["compass_angle"], PITCH_DEG, ROLL_DEG)
-    K  = build_intrinsics(img_w, img_h, H_FOV_DEG)
+    # ── Load images and pre-compute camera matrices ──────────────────────────
+    cam_data = []
+    for ci, cam in enumerate(cameras):
+        img = cv2.imread(cam["image_path"])
+        if img is None:
+            raise FileNotFoundError(cam["image_path"])
+        h, w = img.shape[:2]
+        Cw = camera_center_utm(cam)
+        if "computed_rotation" in cam:
+            R = rotation_from_angle_axis(cam["computed_rotation"])
+        else:
+            R = rotation_world_to_camera(cam["compass_angle"],
+                                         cam.get("pitch_deg", 0.0),
+                                         cam.get("roll_deg",  0.0))
+        if "camera_parameters" in cam:
+            K = build_intrinsics_from_params(w, h, cam["camera_parameters"])
+        else:
+            K = build_intrinsics(w, h, cam.get("hfov_deg", 65.0))
+        cam_data.append({"img": img, "w": w, "h": h, "Cw": Cw, "R": R, "K": K})
+        print(f"  Camera {ci}: {cam['image_path']}  ({w}×{h})")
 
     verts        = mesh.vertices
     faces        = mesh.faces
-    mesh.face_normals
+    _            = mesh.face_normals          # trigger computation
     face_normals = mesh.face_normals
 
-    # ------------------------------------------------------------------
-    # 1. Visibility pass
-    # ------------------------------------------------------------------
-    visible_idx = []
-    face_proj   = []          # (uv_img (3,2) float32, depths (3,) float64)
+    ATLAS_W   = 4096
+    MAX_PATCH = 1024
 
-    print("Visibility pass …")
-    for fi, face in enumerate(faces):
-        V0, V1, V2 = verts[face]
-        center = (V0 + V1 + V2) / 3.0
-        vd = center - Cw;  vd /= np.linalg.norm(vd)
-        if np.dot(face_normals[fi], vd) >= 0:
-            continue
+    # ── Visibility pass: best camera per face ────────────────────────────────
+    # best_hit[fi] = (cam_idx, uv_img (3,2), depths (3,), frontality)
+    best_hit = {}
 
-        uv_img, depths = project(np.array([V0, V1, V2]), Cw, R, K)
-        if not np.all(depths > 0.1):
-            continue
-        pts = uv_img.astype(np.int32)
-        if not (pts[:,0].min() >= 0 and pts[:,0].max() < img_w and
-                pts[:,1].min() >= 0 and pts[:,1].max() < img_h):
-            continue
+    print(f"Visibility pass over {len(cameras)} camera(s) …")
+    for ci, cd in enumerate(cam_data):
+        Cw, R, K = cd["Cw"], cd["R"], cd["K"]
+        w, h     = cd["w"],  cd["h"]
 
-        ray_len = np.linalg.norm(center - Cw)
-        ray_dir = (center - Cw) / ray_len
-        locs, _, idx_tri = mesh.ray.intersects_location([Cw], [ray_dir])
-        if len(locs) > 0:
-            dists = np.linalg.norm(locs - Cw, axis=1)
-            if idx_tri[np.argmin(dists)] != fi and abs(dists.min() - ray_len) >= 0.5:
+        for fi, face in enumerate(faces):
+            V0, V1, V2 = verts[face]
+            center = (V0 + V1 + V2) / 3.0
+            vd = center - Cw;  vd /= np.linalg.norm(vd)
+
+            # Back-face cull
+            frontality = -np.dot(face_normals[fi], vd)   # >0 means facing camera
+            if frontality <= 0:
                 continue
 
-        visible_idx.append(fi)
-        face_proj.append((uv_img.astype(np.float32), depths))
+            uv_img, depths = project(np.array([V0, V1, V2]), Cw, R, K)
+            if not np.all(depths > 0.1):
+                continue
+            pts = uv_img.astype(np.int32)
+            if not (pts[:,0].min() >= 0 and pts[:,0].max() < w and
+                    pts[:,1].min() >= 0 and pts[:,1].max() < h):
+                continue
 
-    print(f"  {len(visible_idx)} visible / {len(faces)} total")
-    if not visible_idx:
-        return mesh
+            # Occlusion test
+            ray_len = np.linalg.norm(center - Cw)
+            ray_dir = (center - Cw) / ray_len
+            locs, _, idx_tri = mesh.ray.intersects_location([Cw], [ray_dir])
+            if len(locs) > 0:
+                dists = np.linalg.norm(locs - Cw, axis=1)
+                if idx_tri[np.argmin(dists)] != fi and abs(dists.min() - ray_len) >= 0.5:
+                    continue
 
-    # ------------------------------------------------------------------
-    # 2. Per-face projective warp → patch
-    # ------------------------------------------------------------------
-    ATLAS_W  = 4096
-    MAX_PATCH = 1024   # cap per-face patch dimensions
+            # Keep this camera if it's the most frontal so far for this face
+            if fi not in best_hit or frontality > best_hit[fi][3]:
+                best_hit[fi] = (ci, uv_img.astype(np.float32), depths, frontality)
 
-    patch_records = []   # dicts filled below
+    print(f"  {len(best_hit)} visible faces / {len(faces)} total  "
+          f"(across {len(cameras)} camera(s))")
+
+    # ── Per-face projective warp → patch ─────────────────────────────────────
+    patch_records = []
 
     print("Extracting per-face patches …")
-    for proj_i, fi in enumerate(visible_idx):
+    for fi, (ci, uv_img, depths, _) in best_hit.items():
         face       = faces[fi]
         V0, V1, V2 = verts[face]
+        cd = cam_data[ci]
+        Cw, R, K = cd["Cw"], cd["R"], cd["K"]
+        real_img = cd["img"]
 
-        # Face-local orthonormal frame: e1 along V0→V1, e2 perp in face plane
-        e1      = V1 - V0
-        e1_len  = np.linalg.norm(e1)
+        # Face-local orthonormal frame
+        e1     = V1 - V0
+        e1_len = np.linalg.norm(e1)
         if e1_len < 1e-6: continue
-        e1_hat  = e1 / e1_len
+        e1_hat = e1 / e1_len
 
-        n       = np.cross(V1 - V0, V2 - V0)
-        n_len   = np.linalg.norm(n)
+        n     = np.cross(V1 - V0, V2 - V0)
+        n_len = np.linalg.norm(n)
         if n_len < 1e-6: continue
-        n_hat   = n / n_len
-        # e2 points "up" along the face (for a wall, roughly +Z)
-        e2_hat  = np.cross(e1_hat, n_hat)   # right-hand: down the face
-        # flip so e2 points upward along the building face
+        n_hat  = n / n_len
+        e2_hat = np.cross(e1_hat, n_hat)
         if e2_hat[2] < 0:
             e2_hat = -e2_hat
 
-        # Local (s, t) of each vertex   (metres, e2 increasing upward)
-        v1_s  = np.dot(V1 - V0, e1_hat)   # = e1_len
-        v1_t  = np.dot(V1 - V0, e2_hat)   # ≈ 0 for horizontal edge
-        v2_s  = np.dot(V2 - V0, e1_hat)
-        v2_t  = np.dot(V2 - V0, e2_hat)
+        v1_s = np.dot(V1 - V0, e1_hat)
+        v1_t = np.dot(V1 - V0, e2_hat)
+        v2_s = np.dot(V2 - V0, e1_hat)
+        v2_t = np.dot(V2 - V0, e2_hat)
 
         s_all = [0.0, v1_s, v2_s];  t_all = [0.0, v1_t, v2_t]
         s_min, s_max = min(s_all), max(s_all)
         t_min, t_max = min(t_all), max(t_all)
         if s_max <= s_min or t_max <= t_min: continue
 
-        # Patch pixel size: use a single consistent pixels-per-metre scale so
-        # that 1 px = the same physical distance in both axes (no stretch).
-        # We derive the scale from the image projection, taking the minimum
-        # px/m across both axes (avoids upscaling the oblique direction).
-        pts_img   = face_proj[proj_i][0]
-        face_w_m  = s_max - s_min          # physical width  (metres)
-        face_h_m  = t_max - t_min          # physical height (metres)
-        img_bw    = max(pts_img[:,0].max() - pts_img[:,0].min(), 1.0)
-        img_bh    = max(pts_img[:,1].max() - pts_img[:,1].min(), 1.0)
-        px_per_m  = min(img_bw / face_w_m, img_bh / face_h_m)
-        patch_w   = int(np.clip(face_w_m * px_per_m, 2, MAX_PATCH))
-        patch_h   = int(np.clip(face_h_m * px_per_m, 2, MAX_PATCH))
+        # Consistent px/m so neither axis is stretched
+        face_w_m = s_max - s_min
+        face_h_m = t_max - t_min
+        img_bw   = max(uv_img[:,0].max() - uv_img[:,0].min(), 1.0)
+        img_bh   = max(uv_img[:,1].max() - uv_img[:,1].min(), 1.0)
+        px_per_m = min(img_bw / face_w_m, img_bh / face_h_m)
+        patch_w  = int(np.clip(face_w_m * px_per_m, 2, MAX_PATCH))
+        patch_h  = int(np.clip(face_h_m * px_per_m, 2, MAX_PATCH))
 
-        # True projective homography: face local (s,t) → image pixel (homogeneous)
-        #   H @ [s, t, 1]^T  =  K @ R @ (V0 + s·e1_hat + t·e2_hat − Cw)
+        # Projective homography: face-local (s,t) → image pixel
         M = np.column_stack([R @ e1_hat, R @ e2_hat, R @ (V0 - Cw)])
-        H = K @ M                          # 3×3, face-local → image
+        H = K @ M
 
-        # S_offset: atlas pixel (ax, ay) → face local (s, t)
-        # s = s_min + ax · ds,   t = t_max − ay · dt  (ay=0 = top = largest t)
+        # Atlas pixel (ax,ay) → face-local (s,t), ay=0 = top of face
         ds = (s_max - s_min) / patch_w
         dt = (t_max - t_min) / patch_h
-        S  = np.array([[ds, 0,  s_min ],
-                       [ 0, -dt, t_max],   # flip t so ay=0 is top of face
-                       [ 0,  0,  1    ]], dtype=np.float64)
+        S  = np.array([[ds,  0,   s_min],
+                       [ 0, -dt,  t_max],
+                       [ 0,  0,   1    ]], dtype=np.float64)
+        H_atlas = H @ S
 
-        H_atlas = H @ S   # atlas pixel → image (homogeneous)
-
-        # Extract patch from real image
         patch_bgr = cv2.warpPerspective(
             real_img, H_atlas, (patch_w, patch_h),
             flags      = cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR,
             borderMode = cv2.BORDER_REPLICATE)
         patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
 
-        # Vertex atlas-pixel positions (matching the S above)
-        def to_px(s, t):
-            ax = (s - s_min) / ds
-            ay = (t_max - t) / dt    # flipped t
-            return (ax, ay)
+        def to_px(s, t, _ds=ds, _dt=dt, _s_min=s_min, _t_max=t_max):
+            return (s - _s_min) / _ds, (_t_max - t) / _dt
 
         patch_records.append({
-            'fi':      fi,
-            'patch':   patch_rgb,
-            'pw':      patch_w,
-            'ph':      patch_h,
-            'v0_px':   to_px(0.0,  0.0 ),
-            'v1_px':   to_px(v1_s, v1_t),
-            'v2_px':   to_px(v2_s, v2_t),
+            'fi':    fi,
+            'patch': patch_rgb,
+            'pw':    patch_w,
+            'ph':    patch_h,
+            'v0_px': to_px(0.0,  0.0 ),
+            'v1_px': to_px(v1_s, v1_t),
+            'v2_px': to_px(v2_s, v2_t),
         })
 
-    # ------------------------------------------------------------------
-    # 3. Pack patches into atlas (simple row packing)
-    # ------------------------------------------------------------------
+    # ── Pack patches into atlas ───────────────────────────────────────────────
     cx, cy, row_h = 0, 0, 0
     for p in patch_records:
         if cx + p['pw'] > ATLAS_W:
@@ -229,19 +297,16 @@ def apply_photo_texture_to_mesh(mesh, image_path):
         cx += p['pw'];  row_h = max(row_h, p['ph'])
     photo_h = cy + row_h
 
-    # Gray fallback strip below the photo rows
-    GRAY_H   = 16
-    atlas_h  = photo_h + GRAY_H
-    atlas    = np.full((atlas_h, ATLAS_W, 3), 180, dtype=np.uint8)
+    GRAY_H  = 16
+    atlas_h = photo_h + GRAY_H
+    atlas   = np.full((atlas_h, ATLAS_W, 3), 180, dtype=np.uint8)
     for p in patch_records:
         atlas[p['ay']:p['ay']+p['ph'], p['ax']:p['ax']+p['pw']] = p['patch']
 
     DEFAULT_U = 0.5
-    DEFAULT_V = 1.0 - (photo_h + GRAY_H / 2) / atlas_h   # centre of gray strip
+    DEFAULT_V = 1.0 - (photo_h + GRAY_H / 2) / atlas_h
 
-    # ------------------------------------------------------------------
-    # 4. Build unrolled mesh with per-face UVs
-    # ------------------------------------------------------------------
+    # ── Unroll mesh, assign UVs ───────────────────────────────────────────────
     n_all     = len(faces)
     new_verts = np.zeros((n_all * 3, 3))
     new_faces = np.arange(n_all * 3, dtype=np.int64).reshape(n_all, 3)
@@ -258,9 +323,7 @@ def apply_photo_texture_to_mesh(mesh, image_path):
             v = 1.0 - (p['ay'] + ay_v) / atlas_h
             new_uvs[fi*3 + j] = [np.clip(u, 0, 1), np.clip(v, 0, 1)]
 
-    # ------------------------------------------------------------------
-    # 5. Export
-    # ------------------------------------------------------------------
+    # ── Export ────────────────────────────────────────────────────────────────
     tex_pil = Image.fromarray(atlas)
     tex_pil.save("building_texture_atlas.png")
     print(f"✓ Atlas saved  ({ATLAS_W}×{atlas_h} px, {len(patch_records)} face patches)")
@@ -271,6 +334,7 @@ def apply_photo_texture_to_mesh(mesh, image_path):
     return new_mesh
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     print("="*60)
     min_lat = min(42.275126, 42.274225);  max_lat = max(42.275126, 42.274225)
@@ -279,7 +343,7 @@ def main():
     origin_lat = (min_lat + max_lat) / 2
 
     mesh_utm      = convert_mesh_to_utm(MESH_PATH, origin_lon, origin_lat)
-    textured_mesh = apply_photo_texture_to_mesh(mesh_utm, IMAGE_PATH)
+    textured_mesh = apply_photo_texture_to_mesh(mesh_utm, CAMERAS)
 
     t_utm  = Transformer.from_crs("EPSG:4326", f"EPSG:{UTM_EPSG}", always_xy=True)
     ox, oy = t_utm.transform(origin_lon, origin_lat)
@@ -291,7 +355,6 @@ def main():
         direction=[1.0, 0.0, 0.0],
         point=[0.0, 0.0, 0.0],
     )
-
     textured_mesh.apply_transform(rotation)
     print(f"Exporting → {OUTPUT_MESH}")
     textured_mesh.export(OUTPUT_MESH)
