@@ -1,0 +1,9 @@
+trimesh
+pyproj
+opencv-python
+Pillow
+numpy
+torch
+transformers
+accelerate
+huggingface_hub
