@@ -6,6 +6,7 @@ from pyproj import Transformer
 from PIL import Image
 import torch
 from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
+from simple_lama_inpainting import SimpleLama
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -81,6 +82,10 @@ OBSTRUCTION_CLASSES = {
 # Swap for "swin-small" if you want faster (but less accurate) segmentation.
 SEG_MODEL_ID = "facebook/mask2former-swin-large-cityscapes-semantic"
 
+# LaMa is run at this max dimension to keep CPU inference manageable.
+# The inpainted result is blended back at full resolution.
+LAMA_MAX_DIM = 1024
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -153,6 +158,49 @@ def convert_mesh_to_utm(mesh_path, origin_lon, origin_lat):
 # ──────────────────────────────────────────────────────────────────────────────
 _seg_proc  = None
 _seg_model = None
+_lama      = None
+
+def _load_lama():
+    """Load SimpleLama, forcing CPU via a temporary torch.jit.load patch."""
+    global _lama
+    if _lama is not None:
+        return _lama
+    print("Loading LaMa inpainting model …")
+    _orig = torch.jit.load
+    torch.jit.load = lambda *a, **kw: _orig(*a, **{**kw, "map_location": "cpu"})
+    try:
+        _lama = SimpleLama()
+    finally:
+        torch.jit.load = _orig
+    return _lama
+
+def synthesize_texture(img_bgr, mask):
+    """
+    Fill masked regions using LaMa texture synthesis.
+    Inference runs at LAMA_MAX_DIM; result is blended back at full resolution.
+
+    img_bgr : uint8 BGR  (H, W, 3)
+    mask    : uint8 mono (H, W), 255 = fill, 0 = keep
+    """
+    lama  = _load_lama()
+    h, w  = img_bgr.shape[:2]
+
+    # Resize down for inference
+    scale  = min(1.0, LAMA_MAX_DIM / max(h, w))
+    ih, iw = int(h * scale), int(w * scale)
+    img_s  = cv2.resize(img_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
+    msk_s  = cv2.resize(mask,    (iw, ih), interpolation=cv2.INTER_NEAREST)
+
+    pil_img  = Image.fromarray(cv2.cvtColor(img_s, cv2.COLOR_BGR2RGB))
+    pil_mask = Image.fromarray(msk_s)
+    result_s = cv2.cvtColor(np.array(lama(pil_img, pil_mask)), cv2.COLOR_RGB2BGR)
+
+    # Blend inpainted result back into original-resolution image
+    inpainted = cv2.resize(result_s, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = img_bgr.copy()
+    out[mask > 0] = inpainted[mask > 0]
+    return out
+
 
 def _load_seg_model():
     global _seg_proc, _seg_model
@@ -219,9 +267,8 @@ def apply_photo_texture_to_mesh(mesh, cameras):
             print(f"    Segmenting obstructions …")
             obs_mask = build_obstruction_mask(img)
             n_obs = int((obs_mask > 0).sum())
-            print(f"    Masking {n_obs:,} obstruction pixels → black")
-            img = img.copy()
-            img[obs_mask > 0] = 0
+            print(f"    Synthesizing texture for {n_obs:,} obstruction pixels …")
+            img = synthesize_texture(img, obs_mask)
 
         Cw = camera_center_utm(cam)
         if "computed_rotation" in cam:
